@@ -1,0 +1,317 @@
+#include "cache.h"
+#include "ooo_cpu.h"
+
+#define P0 0 //H2P Prefetcher
+#define P1 1 //MASP Prefetcher
+#define P2 2 //STP Prefetcher
+
+unordered_set <uint64_t> fpq[3]; //Fake Prefetch Queue (FPQ) for all three constituent prefetcher
+queue <uint64_t> aux_fpq[3]; //Helper queue to implement FIFO order in FPQ
+
+uint64_t pf_addr_stp[5]; //Used to store STP's predicted prefetch pages
+uint64_t pf_addr_h2p[2]; //Used to store H2P's predicted prefetch pages
+uint64_t pf_addr_masp[2]; //Used to store MASP's predicted prefetch pages
+
+int64_t stride, last_stride;
+
+#define FPQ_MAX_SIZE 16 //Size of FPQ
+#define MASP_TABLE_MAX_SIZE 64 //Size of MASP table
+
+//#c0 - enable_pref
+//#c1 - select_1
+//#c2 - select_2
+uint16_t c0, c1, c2;
+
+uint64_t atp_total, stp_c, h2p_c, masp_c, dead_c; //Counters to check activity of constituent prefetchers
+
+uint64_t a, b, e; //Last three virtual pages to miss in STLB
+
+//Blueprint of MASP Table
+class MASP_TABLE{
+    public: 
+    uint64_t ip;
+    uint64_t last_page;
+    int64_t last_stride;
+    uint32_t lru;
+
+    MASP_TABLE(){
+        ip = -1;
+        last_page = -1;
+        last_stride = 0;
+        lru = 0;
+    };
+};
+
+MASP_TABLE masp_table[MASP_TABLE_MAX_SIZE];
+
+//Decision ladder to select prefetcher
+void update_counters(bool h0, bool h1, bool h2){
+    assert(c0<=256);
+    if(c0==256) c0=0;
+
+    assert(c1<=64);
+    if(c1==64) c1=0;
+
+    assert(c2<=4);
+    if(c2==4) c2=0;
+
+    if(!h0 && !h1 && !h2){
+        if(c0) c0--;
+    }
+    else if(!h0 && !h1 && h2){
+        c0++; c2++;
+        if(c1) c1--;
+    }
+    else if(!h0 && h1 && !h2){
+        c0++;
+        if(c1) c1--;
+        if(c2) c2--;
+    }
+    else if(!h0 && h1 && h2){
+        c0++;
+        if(c1) c1--;
+    }
+    else if(h0 && !h1 && !h2){
+        c0++; c1++;
+    }
+    else if(h0 && !h1 && h2){
+        c0++; c2++;
+    }
+    else if(h0 && h1 && !h2){
+        c0++;
+        if(c2) c2--;
+    }
+    else if(h0 && h1 && h2){
+        c0++;
+    }
+
+}
+
+//Update FPQ of constituent prefetchers with their predicted prefetch pages
+void update_fpq(int p, uint64_t *pf_addr, int n){
+    for(int i=0;i<n;i++){
+        if(p==P2 && i==2) continue;
+        if(p==P1 && pf_addr[i]==0) continue;
+        uint64_t vpage = pf_addr[i] >> LOG2_PAGE_SIZE;
+       
+        if(fpq[p].find(vpage)==fpq[p].end()){
+            if(fpq[p].size()<FPQ_MAX_SIZE){
+                fpq[p].insert(vpage);
+                aux_fpq[p].push(vpage);
+            }
+            else{
+                assert(fpq[p].size()==FPQ_MAX_SIZE);
+                fpq[p].erase(aux_fpq[p].front());
+                aux_fpq[p].pop();
+                fpq[p].insert(vpage);
+                aux_fpq[p].push(vpage);
+            }
+        }
+    }
+}
+
+//Calculating H2P's predicted prefetch pages
+void h2p_update_pfaddr(uint64_t addr){
+
+    if(a==0 || b==0 || e==0) return;
+    int64_t diff1 = e-b;
+    int64_t diff2 = b-a;
+
+    pf_addr_h2p[0] = ((addr >> LOG2_PAGE_SIZE) + diff1) << LOG2_PAGE_SIZE;
+    pf_addr_h2p[1] = ((addr >> LOG2_PAGE_SIZE) + diff2) << LOG2_PAGE_SIZE;
+}
+
+//Calculating MASP's predicted prefetch pages
+void masp_update_pfaddr(uint64_t addr, uint64_t ip){
+
+    uint64_t page = addr >> LOG2_PAGE_SIZE;
+    int index = -1;
+    for(index=0;index<MASP_TABLE_MAX_SIZE;index++){ //Check if Instruction Pointer (Program Counter) already present in MASP table
+        if(masp_table[index].ip == ip) break;
+    }
+
+    if(index == MASP_TABLE_MAX_SIZE){ //If MASP table is full, remove LRU entry and add current accessing Instruction Pointer
+
+        for (index=0; index<MASP_TABLE_MAX_SIZE; index++) {
+            if (masp_table[index].lru == (MASP_TABLE_MAX_SIZE-1))
+                break;
+        }
+
+        masp_table[index].ip = ip;
+        masp_table[index].last_page = page;
+        masp_table[index].last_stride = 0;
+
+        for (int i=0; i<MASP_TABLE_MAX_SIZE; i++) {
+            if (masp_table[i].lru < masp_table[index].lru)
+                masp_table[i].lru++;
+        }
+        masp_table[index].lru = 0;
+    }
+
+    assert(index!=-1);
+
+    //Calculate current stride
+    stride = (page >= masp_table[index].last_page)?
+                     (page - masp_table[index].last_page):
+                     (masp_table[index].last_page - page) * -1;
+
+    last_stride = masp_table[index].last_stride;
+
+    //Calculate predicted prefetch pages
+    if(last_stride!=0){
+        pf_addr_masp[0] = ((addr >> LOG2_PAGE_SIZE) + last_stride) << LOG2_PAGE_SIZE;
+    }
+    else{
+        pf_addr_masp[0] = 0;
+    }
+    if(stride!=0){
+        pf_addr_masp[1] = ((addr >> LOG2_PAGE_SIZE) + stride) << LOG2_PAGE_SIZE;
+    }
+    else{
+        pf_addr_masp[1]= 0;
+    }
+
+}
+
+//Calculating STP's predicted prefetch pages
+void stp_update_pfaddr(uint64_t addr){
+    for(int i=-2; i<=2; i++){
+        if(i==0) continue;
+        pf_addr_stp[i+2] = ((addr >> LOG2_PAGE_SIZE) + i) << LOG2_PAGE_SIZE;
+    }
+
+}
+        
+
+void CACHE::stlb_prefetcher_initialize() {
+    c0=128; c1=0; c2=0;
+    a=0; b=0; e=0;
+    atp_total=0; h2p_c=0; stp_c=0; masp_c=0; dead_c=0;
+    stride=0; last_stride=0;
+
+    for(int i=0;i<MASP_TABLE_MAX_SIZE;i++){
+        masp_table[i].lru = i;
+    }
+}
+
+//Store last 3 virtual pages to miss in STLB
+void CACHE::stlb_update_last_vpage(uint64_t vpage){
+    a=b;
+    b=e;
+    e=vpage;
+}
+
+//Update FPQ of constituent prefetchers
+void update_pfaddr(uint64_t addr, uint64_t ip,
+                                    uint8_t cache_hit, uint8_t type,
+                                    uint64_t prefetch_id, uint8_t instruction){
+    h2p_update_pfaddr(addr);
+    stp_update_pfaddr(addr);
+    masp_update_pfaddr(addr, ip);
+    update_fpq(P0, pf_addr_h2p, 2);
+    update_fpq(P2, pf_addr_stp, 5);
+    update_fpq(P1, pf_addr_masp, 2);
+}
+
+//Prefetch pages predicted by H2P
+void CACHE::h2p_operate(uint64_t addr, uint64_t ip,
+                                    uint8_t cache_hit, uint8_t type,
+                                    uint64_t prefetch_id, uint8_t instruction, uint32_t cpu) {
+    h2p_update_pfaddr(addr);
+    for(int i=0;i<2;i++){
+        prefetch_translation(ip, pf_addr_h2p[i], FILL_STLB, 0, prefetch_id, instruction);
+        ooo_cpu[cpu].sbfp.extract_and_fill(pf_addr_h2p[i]>>LOG2_PAGE_SIZE, cpu); //Get free prefetches
+    }
+}
+
+//Prefetch pages predicted by STP
+void CACHE::stp_operate(uint64_t addr, uint64_t ip,
+                                    uint8_t cache_hit, uint8_t type,
+                                    uint64_t prefetch_id, uint8_t instruction, uint32_t cpu) {
+    for(int i=-2; i<=2; i++){
+        if(i==0) continue;
+        prefetch_translation(ip, pf_addr_stp[i+2], FILL_STLB, 0, prefetch_id, instruction);
+        ooo_cpu[cpu].sbfp.extract_and_fill(pf_addr_stp[i+2]>>LOG2_PAGE_SIZE, cpu); //Get free prefetches
+    }
+}
+
+//Prefetch pages predicted by MASP
+void CACHE::masp_operate(uint64_t addr, uint64_t ip,
+                                    uint8_t cache_hit, uint8_t type,
+                                    uint64_t prefetch_id, uint8_t instruction, uint32_t cpu) {
+    if(last_stride!=0){
+        prefetch_translation(ip, pf_addr_masp[0], FILL_STLB, 0, prefetch_id, instruction);
+        ooo_cpu[cpu].sbfp.extract_and_fill(pf_addr_masp[0]>>LOG2_PAGE_SIZE, cpu); //Get free prefetches
+    }
+    if(stride!=0){
+        prefetch_translation(ip, pf_addr_masp[1], FILL_STLB, 0, prefetch_id, instruction);
+        ooo_cpu[cpu].sbfp.extract_and_fill(pf_addr_masp[1]>>LOG2_PAGE_SIZE, cpu); //Get free prefetches
+    }
+}
+
+void CACHE::stlb_prefetcher_operate(uint64_t addr, uint64_t ip,
+                                    uint8_t cache_hit, uint8_t type,
+                                    uint64_t prefetch_id, uint8_t instruction, uint32_t cpu) {
+    
+    atp_total++; //Counts number of time ATP is accessed
+
+    uint64_t vpage = addr >> LOG2_PAGE_SIZE;
+
+    //Check virtual page triggering prefetch is present in which constituent prefetcher's FPQ
+    bool h0 = false, h1 = false, h2 = false;
+    if(fpq[P0].find(vpage)!=fpq[P0].end()) h0 = true; 
+    if(fpq[P1].find(vpage)!=fpq[P1].end()) h1 = true;
+    if(fpq[P2].find(vpage)!=fpq[P2].end()) h2 = true;
+
+    update_counters(h0, h1, h2); //Update counters to select prefetcher to operate
+
+    stlb_update_last_vpage(vpage); //Update last virtual pages to fault
+
+    update_pfaddr(addr, ip, cache_hit, type, prefetch_id, instruction); //update FPQ of all prefetchers
+
+    if(c0>=128){    //MSB of c0 should be 1 to enable prefetching
+        int prefetcher_to_use = -1;
+        if(c1>=32){ //If MSB of c1 is 1, choose H2P
+            prefetcher_to_use = P0;
+            h2p_c++;
+
+        } 
+        else{
+            if(c2>=2){ //If MSB of c2 is 1, choose STP
+                prefetcher_to_use = P2;
+                stp_c++;
+            } 
+            else{
+                prefetcher_to_use = P1; //If MSB of c2 is not 1, choose MASP
+                masp_c++;
+            } 
+        }
+
+        if(prefetcher_to_use == P0) h2p_operate(addr, ip, cache_hit, type, prefetch_id, instruction, cpu);
+        else if (prefetcher_to_use == P1) masp_operate(addr, ip, cache_hit, type, prefetch_id, instruction, cpu);
+        else if (prefetcher_to_use == P2) stp_operate(addr, ip, cache_hit, type, prefetch_id, instruction, cpu);
+    }
+    else{ 
+        //If MSB of c0 is not 1 then disable prefetching
+        dead_c++;
+    }
+
+}
+
+//Printing ATP's access stats
+void CACHE::print_atp_stats(){
+    cout<<"ATP ACCESSED   "<< atp_total<<"   STP ACTIVE   "<<((double)stp_c/(double)atp_total)*100<<
+    "   H2P ACTIVE    "<<((double)h2p_c/(double)atp_total)*100<<"   MASP ACTIVE    "<<((double)masp_c/(double)atp_total)*100<<
+    "   INACTIVE    "<<((double)dead_c/(double)atp_total)*100<<endl;
+
+    if(dead_c!=(atp_total -(stp_c+h2p_c+masp_c))){
+      cout<<"Something's Wrong. I can feel it"<<endl;
+    }
+}
+
+void CACHE::stlb_prefetcher_cache_fill(uint64_t addr, uint32_t set,
+                                       uint32_t way, uint8_t prefetch,
+                                       uint64_t evicted_addr,
+                                       uint32_t metadata_in) {}
+
+void CACHE::stlb_prefetcher_final_stats() {}

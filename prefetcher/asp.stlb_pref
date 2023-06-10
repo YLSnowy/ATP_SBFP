@@ -1,0 +1,85 @@
+#include "cache.h"
+
+#define ASP_TABLE_MAX_SIZE 16
+
+int c=0;
+
+class ASP_TABLE{
+    public: 
+    uint64_t ip;
+    int64_t last_page;
+    int64_t last_stride;
+    uint32_t lru;
+    uint32_t state;
+
+    ASP_TABLE(){
+        ip = -1;
+        last_page = -1;
+        last_stride = 0;
+        lru = 0;
+        state = 0;
+    };
+};
+
+ASP_TABLE asp_table[ASP_TABLE_MAX_SIZE];
+
+void CACHE::stlb_prefetcher_initialize() {
+    for(int i=0;i<ASP_TABLE_MAX_SIZE;i++){
+        asp_table[i].lru = i;
+    }
+   // cout<<"Control reaching in initializer\n";
+}
+
+void CACHE::stlb_prefetcher_operate(uint64_t addr, uint64_t ip,
+                                    uint8_t cache_hit, uint8_t type,
+                                    uint64_t prefetch_id, uint8_t instruction, uint32_t cpu) {
+    uint64_t vpage = addr >> LOG2_PAGE_SIZE;
+    int index = -1;
+    for(index=0;index<ASP_TABLE_MAX_SIZE;index++){
+        if(asp_table[index].ip == ip) break;
+    }
+
+    if(index == ASP_TABLE_MAX_SIZE){
+
+        for (index=0; index<ASP_TABLE_MAX_SIZE; index++) {
+            if (asp_table[index].lru == (ASP_TABLE_MAX_SIZE-1))
+                break;
+        }
+
+        asp_table[index].ip = ip;
+        asp_table[index].last_page = vpage;
+        asp_table[index].last_stride = 0;
+        asp_table[index].state = 0;
+
+        for (int i=0; i<ASP_TABLE_MAX_SIZE; i++) {
+            if (asp_table[i].lru < asp_table[index].lru)
+                asp_table[i].lru++;
+        }
+        asp_table[index].lru = 0;
+    }
+
+    assert(index!=-1);
+    //cout<<"Control reaching on 1st point\n";
+    if(asp_table[index].last_page != -1){
+	//cout<<"Control reaching on 2nd point\n";
+        int64_t curr_stride = vpage - asp_table[index].last_page;
+        asp_table[index].last_page = vpage;
+        if(curr_stride == asp_table[index].last_stride) asp_table[index].state++;
+        else asp_table[index].state = 0;
+        asp_table[index].last_stride = curr_stride;
+        if(asp_table[index].state>2){
+            c++;
+            uint64_t pref_addr = (vpage + curr_stride) << LOG2_PAGE_SIZE;
+            prefetch_translation(ip, pref_addr, FILL_STLB, 0, prefetch_id, instruction);
+        } 
+    }
+}
+
+void CACHE::stlb_prefetcher_cache_fill(uint64_t addr, uint32_t set,
+                                       uint32_t way, uint8_t prefetch,
+                                       uint64_t evicted_addr,
+                                       uint32_t metadata_in) {}
+
+void CACHE::stlb_prefetcher_final_stats() {
+    cout<<"Prefetches issued by ASP are: "<<c<<endl;
+}
