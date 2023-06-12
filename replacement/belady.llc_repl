@@ -1,0 +1,158 @@
+#include "cache.h"
+#include <errno.h>
+#include <limits.h>
+#include <stdbool.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+
+
+#define TRACE_LEN 400000
+long long unsigned *id_list, *addr_list, *set_list;
+int line_count;
+int start;
+
+// initialize replacement state
+void CACHE::llc_initialize_replacement()
+{
+    printf("LLC Belady Replacement Policy\n");
+    // load memtrace file
+    id_list = (long long unsigned*)calloc(TRACE_LEN, sizeof(long long unsigned));
+    addr_list = (long long unsigned*)calloc(TRACE_LEN, sizeof(long long unsigned));
+    set_list = (long long unsigned*)calloc(TRACE_LEN, sizeof(long long unsigned));
+    char* filename = "/home/liz/cache/ATP_SBFP/belady_input.txt";
+    char* line_buf = NULL;
+    size_t line_buf_size = 0;
+    line_count = 0;
+    start = 0;
+    ssize_t line_size;
+    FILE* fp = fopen(filename, "r");
+    if (!fp) {
+        fprintf(stderr, "Error opening file '%s'\n", filename);
+        assert(0);
+    }
+
+    line_size = getline(&line_buf, &line_buf_size, fp);
+
+    while (line_size > 0) {
+        // line_buf store the line read from file.
+        errno = 0;
+        char* p = line_buf;
+        char* end;
+        id_list[line_count] = strtol(p, &end, 10);
+        p = end;
+        addr_list[line_count] = strtol(p, &end, 10);
+        p = end;
+        set_list[line_count] = strtol(p, &end, 10);
+
+        line_count++;
+        line_size = getline(&line_buf, &line_buf_size, fp);
+    }
+    fclose(fp);
+
+    /* for (int i = 100000; i < line_count; i++) { */
+    /*     printf("id_list[%d] = %llu\t", i, id_list[i]); */
+    /*     printf("addr_list[%d] = %llu\t", i, addr_list[i]); */
+    /*     printf("set_list[%d] = %llu\n", i, set_list[i]); */
+    /* } */
+}
+
+// find replacement victim
+uint32_t CACHE::llc_find_victim(uint32_t cpu, uint64_t instr_id, uint32_t set, const BLOCK* current_set, uint64_t ip, uint64_t full_addr, uint32_t type)
+{
+    if (cache_type != IS_LLC || instr_id == 0)
+        return lru_victim(cpu, instr_id, set, current_set, ip, full_addr, type);
+    uint32_t way = 0;
+    int victim = NUM_WAY;
+    int distance = 0;
+    int i;
+
+    // fill invalid line first
+    for (way = 0; way < NUM_WAY; way++) {
+        if (block[set][way].valid == false) {
+            /* DP_BELADY(if (warmup_complete[cpu]) { */
+            /*     cout << "[" << NAME << "] " << __func__ << " instr_id: " << instr_id << " invalid set: " << set << " way: " << way; */
+            /*     cout << hex << " address: " << (full_addr >> LOG2_BLOCK_SIZE) << " victim address: " << block[set][way].address << " data: " << block[set][way].data << dec << endl; */
+            /* }); */
+            return way;
+        }
+    }
+
+    // find current position in future list
+    for (i = start; i < line_count; i++) {
+        if (id_list[i] >= instr_id) {
+            start = i;
+            break;
+        }
+    }
+
+    for (way = 0; way < NUM_WAY; way++) {
+        for (i = start + 1; i < line_count; i++) {
+            if (set == set_list[i] && addr_list[i] == block[set][way].tag) {
+                if (i - start > distance) {
+                    distance = i - start;
+                    victim = way;
+                }
+                /* DP_BELADY(if (warmup_complete[cpu]) { */
+                /*     cout << "[" << NAME << "] " << __func__ << " instr_id: " << instr_id << " set: " << set << " way: " << way; */
+                /*     cout << " tag: " << block[set][way].tag << " [Belady] distance: " << i - start << " start: " << start << " next-id: " << id_list[i] << endl; */
+                /* }); */
+                break;
+            }
+        }
+        if (i == line_count) {
+            /* DP_BELADY(if (warmup_complete[cpu]) { */
+            /*     cout << "[" << NAME << "] " << __func__ << " instr_id: " << instr_id << " set: " << set << " way: " << way; */
+            /*     cout << " tag: " << block[set][way].tag << " [Belady] never used" << endl; */
+            /* }); */
+            return way;
+        }
+    }
+    if (victim != NUM_WAY) {
+        DP_BELADY(if (warmup_complete[cpu]) {
+            cout << "[" << NAME << "] " << __func__ << " instr_id: " << instr_id << " set: " << set;
+            cout << " [Belady] find the farthest accessed victim: " << victim << ", and its distance: " << distance << endl;
+        });
+        return victim;
+    }
+
+    // should not arrive here.
+    cerr << "[" << NAME << "] " << __func__ << " no victim! set: " << set << endl;
+    assert(0);
+    // baseline LRU
+    return lru_victim(cpu, instr_id, set, current_set, ip, full_addr, type);
+}
+
+// called on every cache hit and cache fill
+void CACHE::llc_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t way, uint64_t full_addr, uint64_t ip, uint64_t victim_addr, uint32_t type, uint8_t hit)
+{
+    if ((type == WRITEBACK) && ip)
+    assert(0);
+
+  // uncomment this line to see the LLC accesses
+  // cout << "CPU: " << cpu << "  LLC " << setw(9) << TYPE_NAME << " set: " <<
+  // setw(5) << set << " way: " << setw(2) << way; cout << hex << " paddr: " <<
+  // setw(12) << paddr << " ip: " << setw(8) << ip << " victim_addr: " <<
+  // victim_addr << dec << endl;
+
+  // baseline LRU
+  if (hit && (type == WRITEBACK)) // writeback hit does not update LRU state
+    return;
+
+
+    return lru_update(set, way);
+}
+
+void llc_replacement_release()
+{
+    free(id_list);
+    free(addr_list);
+    free(set_list);
+}
+
+void CACHE::llc_replacement_final_stats()
+{
+    llc_replacement_release();
+    printf("belady_final_release!\n");
+}

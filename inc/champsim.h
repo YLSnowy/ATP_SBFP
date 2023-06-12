@@ -21,6 +21,14 @@
 
 // USEFUL MACROS
 //#define DEBUG_PRINT
+/* #define GEN_BELADY */
+/* #define DEBUG_BELADY */
+#define COMPUTE_BYPASS
+#ifdef DEBUG_BELADY
+  #define DP_BELADY(x) x
+#else
+  #define DP_BELADY(x)
+#endif
 #define SANITY_CHECK
 // #define LLC_BYPASS
 // #define L2C_BYPASS

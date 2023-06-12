@@ -63,6 +63,7 @@ public:
       finish_sim_instr, warmup_instructions, simulation_instructions,
       instrs_to_read_this_cycle, instrs_to_fetch_this_cycle,
       next_print_instruction, num_retired;
+  uint32_t last_count_cycle, num_cycles_per_kilo_instruction;
   uint32_t inflight_reg_executions, inflight_mem_executions, num_searched;
   uint32_t next_ITLB_fetch;
 
@@ -160,6 +161,8 @@ public:
     instrs_to_read_this_cycle = 0;
     instrs_to_fetch_this_cycle = 0;
 
+    last_count_cycle = 0;
+    num_cycles_per_kilo_instruction = 0;
     next_print_instruction = STAT_PRINTING_PERIOD;
     num_retired = 0;
 

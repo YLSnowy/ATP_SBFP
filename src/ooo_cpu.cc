@@ -1992,6 +1992,14 @@ void O3_CPU::retire_rob() {
       return;
     }
 
+    // statistic current IPC
+    if (ROB.entry[ROB.head].instr_id % 100 == 0) {
+      if (last_count_cycle != 0)
+        num_cycles_per_kilo_instruction = current_core_cycle[cpu] - last_count_cycle;
+      last_count_cycle = current_core_cycle[cpu];
+    }
+
+
     // check store instruction
     uint32_t num_store = 0;
     for (uint32_t i = 0; i < MAX_INSTR_DESTINATIONS; i++) {
@@ -2092,5 +2100,6 @@ void O3_CPU::retire_rob() {
     	file2 << num_retired << " " << sum_mshr_stall << " " << current_core_cycle[cpu] << " " << ROB.entry[ROB.head].executed << endl;;
 		// cout << sum_mshr_stall << endl;
 	}	
+    
   }
 }
